@@ -186,5 +186,6 @@ def handle_message(message):
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
-    print("Бот Алина запущен...")
+    print("Бот Алина bot.remove_webhook()         # ← эта строчка удаляет вебхук
     bot.infinity_polling()
+    
