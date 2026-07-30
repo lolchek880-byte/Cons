@@ -1,0 +1,3 @@
+pyTeleBotAPI
+groq
+python-dotenv
