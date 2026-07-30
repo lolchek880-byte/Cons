@@ -176,6 +176,7 @@ def reset_dialog(message):
 def handle_message(message):
     user_id = message.from_user.id
     user_text = message.text
+    print(f"Получено сообщение от {user_id}: {user_text}")
     if user_id not in user_histories or len(user_histories[user_id]) == 0:
         send_welcome(message)
     reply = get_groq_response(user_id, user_text)
