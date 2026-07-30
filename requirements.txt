@@ -1,3 +1,3 @@
-pyTelegramBotAPI==4.25.1
-groq==0.11.0
-python-dotenv==1.0.1
+pyTelegramBotAPI
+groq
+python-dotenv
