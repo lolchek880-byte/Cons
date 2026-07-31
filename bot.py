@@ -1,4 +1,5 @@
 import os
+
 import sys
 import subprocess
 
@@ -186,6 +187,6 @@ def handle_message(message):
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
-    print("Бот Алина bot.remove_webhook()         # ← эта строчка удаляет вебхук
+    print("Бот Алина запущен...")
+    bot.remove_webhook()
     bot.infinity_polling()
-    
