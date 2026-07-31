@@ -40,7 +40,7 @@ GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 if not TELEGRAM_TOKEN or not GROQ_API_KEY:
     raise ValueError("Не найдены TELEGRAM_TOKEN или GROQ_API_KEY")
 
-# -------- ПРИНУДИТЕЛЬНО УДАЛЯЕМ ВЕБХУК (с повторной попыткой) ----------
+# -------- ПРИНУДИТЕЛЬНО УДАЛЯЕМ ВЕБХУК ----------
 try:
     import requests
     for _ in range(3):
@@ -52,8 +52,12 @@ try:
 except Exception as e:
     print("Ошибка удаления вебхука:", e)
 
-# -------- КОНФИГУРАЦИЯ ----------
-MODEL_NAME = "llama-3.3-70b-versatile"   # актуальная модель
+# ============================================================
+# ⚠️  ВНИМАНИЕ! ЕДИНСТВЕННОЕ МЕСТО, ГДЕ УКАЗЫВАЕТСЯ МОДЕЛЬ
+# ============================================================
+MODEL_NAME = "llama-3.3-70b-versatile"   # <-- ЭТО АКТУАЛЬНАЯ МОДЕЛЬ
+# ============================================================
+
 MAX_HISTORY = 10
 
 SYSTEM_PROMPT = (
@@ -101,7 +105,6 @@ class AlinaBot:
         def text_handler(message):
             self._handle_text(message)
 
-    # ---------- РАБОТА С ИСТОРИЕЙ ----------
     def _get_history(self, user_id: int) -> List[Dict[str, str]]:
         return self.user_histories.get(user_id, [])
 
@@ -116,7 +119,6 @@ class AlinaBot:
         self.user_histories.pop(user_id, None)
         self.user_facts.pop(user_id, None)
 
-    # ---------- ИЗВЛЕЧЕНИЕ ФАКТОВ ----------
     def _update_facts(self, user_id: int, message: str) -> None:
         facts = self.user_facts.get(user_id, {})
         lower_msg = message.lower()
@@ -132,7 +134,6 @@ class AlinaBot:
                     break
 
         if not facts.get('age'):
-            # Ищем число как отдельное слово (не внутри другого слова)
             age_match = re.search(r'\b([1-9][0-9]?)\b', message)
             if age_match:
                 age = int(age_match.group(1))
@@ -171,7 +172,6 @@ class AlinaBot:
             known.append("согласие на выпивку: " + ("да" if facts['agreed'] else "нет"))
         return "Известная информация о собеседнике: " + ", ".join(known) + "." if known else ""
 
-    # ---------- ОБРАЩЕНИЕ К GROQ ----------
     def _get_groq_response(self, user_id: int, user_message: str) -> str:
         self._update_facts(user_id, user_message)
         self._update_history(user_id, "user", user_message)
@@ -196,7 +196,6 @@ class AlinaBot:
             logging.error(f"Ошибка Groq: {e}")
             return "😅 Что-то пошло не так… Давай попробуем ещё раз?"
 
-    # ---------- ОБРАБОТЧИКИ СООБЩЕНИЙ ----------
     def _send_welcome(self, message):
         user_id = message.from_user.id
         self._clear_history(user_id)
@@ -227,21 +226,17 @@ class AlinaBot:
         user_id = message.from_user.id
         user_text = message.text
 
-        # Если сообщение не содержит текста — игнорируем (или отвечаем, что бот не понимает)
         if not user_text or not user_text.strip():
             self.bot.reply_to(message, "😅 Я понимаю только текстовые сообщения. Напиши что-нибудь!")
             return
 
-        # Если истории нет – отправляем только приветствие и выходим (не обрабатываем через Groq)
         if user_id not in self.user_histories or not self.user_histories[user_id]:
             self._send_welcome(message)
             return
 
-        # Обычный диалог
         reply = self._get_groq_response(user_id, user_text.strip())
         self.bot.reply_to(message, reply)
 
-    # ---------- ЗАПУСК ----------
     def run(self):
         logging.basicConfig(level=logging.INFO)
         print("Бот Алина запущен...")
