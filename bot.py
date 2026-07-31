@@ -3,6 +3,7 @@ import sys
 import subprocess
 import re
 import logging
+import time
 from typing import Dict, List, Optional
 
 # -------- АВТОУСТАНОВКА БИБЛИОТЕК ----------
@@ -39,17 +40,18 @@ GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 if not TELEGRAM_TOKEN or not GROQ_API_KEY:
     raise ValueError("Не найдены TELEGRAM_TOKEN или GROQ_API_KEY")
 
-# -------- ПРИНУДИТЕЛЬНО УДАЛЯЕМ ВЕБХУК ----------
+# -------- ПРИНУДИТЕЛЬНО УДАЛЯЕМ ВЕБХУК (и ждём, чтобы Telegram обработал) ----------
 try:
     import requests
     resp = requests.get(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/deleteWebhook")
     print("Webhook удалён:", resp.json())
+    time.sleep(1)  # даём время Telegram обработать запрос
 except Exception as e:
     print("Ошибка удаления вебхука:", e)
 
 # -------- КОНФИГУРАЦИЯ ----------
-# Используем актуальную модель вместо устаревшей llama3-70b-8192
-MODEL_NAME = "llama-3.3-70b-versatile"   # <-- ГЛАВНОЕ ИСПРАВЛЕНИЕ
+# ✅ АКТУАЛЬНАЯ МОДЕЛЬ (заменяет устаревшую llama3-70b-8192)
+MODEL_NAME = "llama-3.3-70b-versatile"
 MAX_HISTORY = 10
 
 # -------- СИСТЕМНЫЙ ПРОМПТ ----------
@@ -219,6 +221,7 @@ class AlinaBot:
     def run(self):
         logging.basicConfig(level=logging.INFO)
         print("Бот Алина запущен...")
+        print(f"Используется модель: {MODEL_NAME}")
         try:
             self.bot.infinity_polling()
         except Exception as e:
