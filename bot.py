@@ -7,7 +7,6 @@ from typing import Dict, List, Optional
 
 # -------- АВТОУСТАНОВКА БИБЛИОТЕК ----------
 def install(package: str) -> None:
-    """Устанавливает пакет через pip."""
     subprocess.check_call([sys.executable, "-m", "pip", "install", package])
 
 try:
@@ -40,7 +39,7 @@ GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 if not TELEGRAM_TOKEN or not GROQ_API_KEY:
     raise ValueError("Не найдены TELEGRAM_TOKEN или GROQ_API_KEY")
 
-# -------- ПРИНУДИТЕЛЬНО УДАЛЯЕМ ВЕБХУК (на случай, если бот работал в webhook-режиме) ----------
+# -------- ПРИНУДИТЕЛЬНО УДАЛЯЕМ ВЕБХУК ----------
 try:
     import requests
     resp = requests.get(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/deleteWebhook")
@@ -49,8 +48,9 @@ except Exception as e:
     print("Ошибка удаления вебхука:", e)
 
 # -------- КОНФИГУРАЦИЯ ----------
-MODEL_NAME = "llama3-70b-8192"
-MAX_HISTORY = 10  # количество последних сообщений, хранимых в памяти
+# Используем актуальную модель вместо устаревшей llama3-70b-8192
+MODEL_NAME = "llama-3.3-70b-versatile"   # <-- ГЛАВНОЕ ИСПРАВЛЕНИЕ
+MAX_HISTORY = 10
 
 # -------- СИСТЕМНЫЙ ПРОМПТ ----------
 SYSTEM_PROMPT = (
@@ -80,12 +80,9 @@ class AlinaBot:
         self.groq_client = groq.Groq(api_key=groq_api_key)
         self.user_histories: Dict[int, List[Dict[str, str]]] = {}
         self.user_facts: Dict[int, Dict[str, Optional[str]]] = {}
-
-        # Регистрируем обработчики
         self._register_handlers()
 
     def _register_handlers(self) -> None:
-        """Регистрирует все обработчики сообщений."""
         @self.bot.message_handler(commands=['start'])
         def start_handler(message):
             self._send_welcome(message)
@@ -115,11 +112,9 @@ class AlinaBot:
 
     # ---------- ИЗВЛЕЧЕНИЕ ФАКТОВ ----------
     def _update_facts(self, user_id: int, message: str) -> None:
-        """Парсит сообщение пользователя и заполняет известные факты."""
         facts = self.user_facts.get(user_id, {})
         lower_msg = message.lower()
 
-        # Профессия – ищем по ключевым словам
         if not facts.get('profession'):
             professions = [
                 'программист', 'менеджер', 'дизайнер', 'бухгалтер', 'инженер',
@@ -130,7 +125,6 @@ class AlinaBot:
                     facts['profession'] = p.capitalize()
                     break
 
-        # Возраст – ищем число от 18 до 99
         if not facts.get('age'):
             age_match = re.search(r'\b([1-9][0-9]?)\b', message)
             if age_match:
@@ -138,7 +132,6 @@ class AlinaBot:
                 if 18 <= age <= 99:
                     facts['age'] = age
 
-        # Национальность – по списку
         if not facts.get('nationality'):
             nations = [
                 'русский', 'украинец', 'белорус', 'армянин', 'грузин',
@@ -150,7 +143,6 @@ class AlinaBot:
                     facts['nationality'] = n.capitalize()
                     break
 
-        # Согласие на выпивку – проверяем явные маркеры
         if facts.get('agreed') is None:
             if any(w in lower_msg for w in ['да', 'пойду', 'хочу', 'конечно', 'согласен', 'давай']):
                 facts['agreed'] = True
@@ -160,7 +152,6 @@ class AlinaBot:
         self.user_facts[user_id] = facts
 
     def _get_facts_context(self, user_id: int) -> str:
-        """Формирует строку с уже известными фактами для подсказки модели."""
         facts = self.user_facts.get(user_id, {})
         known = []
         if facts.get('profession'):
@@ -175,7 +166,6 @@ class AlinaBot:
 
     # ---------- ОБРАЩЕНИЕ К GROQ ----------
     def _get_groq_response(self, user_id: int, user_message: str) -> str:
-        """Отправляет запрос в Groq и возвращает ответ."""
         self._update_facts(user_id, user_message)
         self._update_history(user_id, "user", user_message)
 
@@ -219,14 +209,8 @@ class AlinaBot:
         user_id = message.from_user.id
         user_text = message.text
 
-        # Если истории нет – автоматически приветствуем
         if user_id not in self.user_histories or not self.user_histories[user_id]:
             self._send_welcome(message)
-            # После приветствия продолжаем обработку введённого текста
-            # (чтобы не дублировать приветствие, можно просто вызвать ответ)
-            # Но лучше позволить боту ответить на первое сообщение после приветствия.
-            # Однако send_welcome уже добавил assistant-сообщение в историю,
-            # поэтому повторно приветствие не отправится.
 
         reply = self._get_groq_response(user_id, user_text)
         self.bot.reply_to(message, reply)
