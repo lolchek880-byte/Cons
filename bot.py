@@ -40,21 +40,22 @@ GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 if not TELEGRAM_TOKEN or not GROQ_API_KEY:
     raise ValueError("Не найдены TELEGRAM_TOKEN или GROQ_API_KEY")
 
-# -------- ПРИНУДИТЕЛЬНО УДАЛЯЕМ ВЕБХУК (и ждём, чтобы Telegram обработал) ----------
+# -------- ПРИНУДИТЕЛЬНО УДАЛЯЕМ ВЕБХУК (с повторной попыткой) ----------
 try:
     import requests
-    resp = requests.get(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/deleteWebhook")
-    print("Webhook удалён:", resp.json())
-    time.sleep(1)  # даём время Telegram обработать запрос
+    for _ in range(3):
+        resp = requests.get(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/deleteWebhook")
+        if resp.status_code == 200:
+            print("Webhook удалён:", resp.json())
+            break
+        time.sleep(1)
 except Exception as e:
     print("Ошибка удаления вебхука:", e)
 
 # -------- КОНФИГУРАЦИЯ ----------
-# ✅ АКТУАЛЬНАЯ МОДЕЛЬ (заменяет устаревшую llama3-70b-8192)
-MODEL_NAME = "llama-3.3-70b-versatile"
+MODEL_NAME = "llama-3.3-70b-versatile"   # актуальная модель
 MAX_HISTORY = 10
 
-# -------- СИСТЕМНЫЙ ПРОМПТ ----------
 SYSTEM_PROMPT = (
     "Ты — Алина, 26 лет, работаешь бухгалтером. "
     "Ты хочешь познакомиться с парнем и пригласить его выпить сегодня вечером. "
@@ -75,7 +76,6 @@ SYSTEM_PROMPT = (
     "Всегда сохраняй игривый и тёплый тон. Используй эмодзи 😊🍷."
 )
 
-# -------- ОСНОВНОЙ КЛАСС БОТА ----------
 class AlinaBot:
     def __init__(self, token: str, groq_api_key: str):
         self.bot = telebot.TeleBot(token)
@@ -92,6 +92,10 @@ class AlinaBot:
         @self.bot.message_handler(commands=['reset'])
         def reset_handler(message):
             self._reset_dialog(message)
+
+        @self.bot.message_handler(commands=['help'])
+        def help_handler(message):
+            self._send_help(message)
 
         @self.bot.message_handler(func=lambda msg: True)
         def text_handler(message):
@@ -128,6 +132,7 @@ class AlinaBot:
                     break
 
         if not facts.get('age'):
+            # Ищем число как отдельное слово (не внутри другого слова)
             age_match = re.search(r'\b([1-9][0-9]?)\b', message)
             if age_match:
                 age = int(age_match.group(1))
@@ -207,14 +212,33 @@ class AlinaBot:
         self._clear_history(user_id)
         self.bot.reply_to(message, "Диалог сброшен. Давай начнём заново! 👋")
 
+    def _send_help(self, message):
+        help_text = (
+            "🤖 *Бот Алина*\n\n"
+            "Команды:\n"
+            "/start — начать диалог\n"
+            "/reset — сбросить историю и факты\n"
+            "/help — эта справка\n\n"
+            "Просто пиши сообщения, и Алина будет с тобой общаться 😊"
+        )
+        self.bot.reply_to(message, help_text, parse_mode='Markdown')
+
     def _handle_text(self, message):
         user_id = message.from_user.id
         user_text = message.text
 
+        # Если сообщение не содержит текста — игнорируем (или отвечаем, что бот не понимает)
+        if not user_text or not user_text.strip():
+            self.bot.reply_to(message, "😅 Я понимаю только текстовые сообщения. Напиши что-нибудь!")
+            return
+
+        # Если истории нет – отправляем только приветствие и выходим (не обрабатываем через Groq)
         if user_id not in self.user_histories or not self.user_histories[user_id]:
             self._send_welcome(message)
+            return
 
-        reply = self._get_groq_response(user_id, user_text)
+        # Обычный диалог
+        reply = self._get_groq_response(user_id, user_text.strip())
         self.bot.reply_to(message, reply)
 
     # ---------- ЗАПУСК ----------
@@ -228,7 +252,6 @@ class AlinaBot:
             logging.error(f"Критическая ошибка в polling: {e}")
             raise
 
-# -------- ТОЧКА ВХОДА ----------
 if __name__ == "__main__":
     bot_instance = AlinaBot(TELEGRAM_TOKEN, GROQ_API_KEY)
     bot_instance.run()
