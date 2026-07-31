@@ -1,13 +1,17 @@
 import os
-
 import sys
 import subprocess
+import requests
+import time
+import random
+import re
+import logging
+from typing import Dict, List
 
 # -------- АВТОУСТАНОВКА БИБЛИОТЕК ----------
 def install(package):
     subprocess.check_call([sys.executable, "-m", "pip", "install", package])
 
-# Проверяем и устанавливаем необходимые библиотеки
 try:
     import telebot
 except ImportError:
@@ -29,7 +33,7 @@ except ImportError:
     install("python-dotenv")
     from dotenv import load_dotenv
 
-# -------- ОСНОВНОЙ КОД БОТА ----------
+# -------- ЗАГРУЗКА ПЕРЕМЕННЫХ ----------
 load_dotenv()
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
@@ -38,19 +42,21 @@ GROQ_API_KEY   = os.getenv("GROQ_API_KEY")
 if not TELEGRAM_TOKEN or not GROQ_API_KEY:
     raise ValueError("Не найдены TELEGRAM_TOKEN или GROQ_API_KEY")
 
-import logging
-import time
-import random
-import re
-from typing import Dict, List
+# -------- ПРИНУДИТЕЛЬНО УДАЛЯЕМ ВЕБХУК ----------
+try:
+    resp = requests.get(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/deleteWebhook")
+    print("Webhook удалён:", resp.json())
+except Exception as e:
+    print("Ошибка удаления вебхука:", e)
 
-bot = telebot.TeleBot(TELEGRAM_TOKEN)
-groq_client = groq.Groq(api_key=GROQ_API_KEY)
-
+# -------- ОСНОВНОЙ КОД БОТА ----------
 MODEL_NAME = "llama3-70b-8192"
 MAX_HISTORY = 10
 MIN_DELAY = 30.0
 MAX_DELAY = 90.0
+
+bot = telebot.TeleBot(TELEGRAM_TOKEN)
+groq_client = groq.Groq(api_key=GROQ_API_KEY)
 
 user_histories: Dict[int, List[dict]] = {}
 user_facts: Dict[int, dict] = {}
@@ -177,7 +183,6 @@ def reset_dialog(message):
 def handle_message(message):
     user_id = message.from_user.id
     user_text = message.text
-    print(f"Получено сообщение от {user_id}: {user_text}")
     if user_id not in user_histories or len(user_histories[user_id]) == 0:
         send_welcome(message)
     reply = get_groq_response(user_id, user_text)
@@ -188,5 +193,4 @@ def handle_message(message):
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
     print("Бот Алина запущен...")
-    bot.remove_webhook()
     bot.infinity_polling()
