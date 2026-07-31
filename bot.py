@@ -1,15 +1,13 @@
 import os
 import sys
 import subprocess
-import requests
-import time
-import random
 import re
 import logging
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 # -------- АВТОУСТАНОВКА БИБЛИОТЕК ----------
-def install(package):
+def install(package: str) -> None:
+    """Устанавливает пакет через pip."""
     subprocess.check_call([sys.executable, "-m", "pip", "install", package])
 
 try:
@@ -37,30 +35,24 @@ except ImportError:
 load_dotenv()
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-GROQ_API_KEY   = os.getenv("GROQ_API_KEY")
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 
 if not TELEGRAM_TOKEN or not GROQ_API_KEY:
     raise ValueError("Не найдены TELEGRAM_TOKEN или GROQ_API_KEY")
 
-# -------- ПРИНУДИТЕЛЬНО УДАЛЯЕМ ВЕБХУК ----------
+# -------- ПРИНУДИТЕЛЬНО УДАЛЯЕМ ВЕБХУК (на случай, если бот работал в webhook-режиме) ----------
 try:
+    import requests
     resp = requests.get(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/deleteWebhook")
     print("Webhook удалён:", resp.json())
 except Exception as e:
     print("Ошибка удаления вебхука:", e)
 
-# -------- ОСНОВНОЙ КОД БОТА ----------
+# -------- КОНФИГУРАЦИЯ ----------
 MODEL_NAME = "llama3-70b-8192"
-MAX_HISTORY = 10
-MIN_DELAY = 30.0
-MAX_DELAY = 90.0
+MAX_HISTORY = 10  # количество последних сообщений, хранимых в памяти
 
-bot = telebot.TeleBot(TELEGRAM_TOKEN)
-groq_client = groq.Groq(api_key=GROQ_API_KEY)
-
-user_histories: Dict[int, List[dict]] = {}
-user_facts: Dict[int, dict] = {}
-
+# -------- СИСТЕМНЫЙ ПРОМПТ ----------
 SYSTEM_PROMPT = (
     "Ты — Алина, 26 лет, работаешь бухгалтером. "
     "Ты хочешь познакомиться с парнем и пригласить его выпить сегодня вечером. "
@@ -81,116 +73,175 @@ SYSTEM_PROMPT = (
     "Всегда сохраняй игривый и тёплый тон. Используй эмодзи 😊🍷."
 )
 
-def get_history(user_id: int) -> List[dict]:
-    return user_histories.get(user_id, [])
+# -------- ОСНОВНОЙ КЛАСС БОТА ----------
+class AlinaBot:
+    def __init__(self, token: str, groq_api_key: str):
+        self.bot = telebot.TeleBot(token)
+        self.groq_client = groq.Groq(api_key=groq_api_key)
+        self.user_histories: Dict[int, List[Dict[str, str]]] = {}
+        self.user_facts: Dict[int, Dict[str, Optional[str]]] = {}
 
-def update_history(user_id: int, role: str, content: str):
-    history = user_histories.get(user_id, [])
-    history.append({"role": role, "content": content})
-    if len(history) > MAX_HISTORY:
-        history = history[-MAX_HISTORY:]
-    user_histories[user_id] = history
+        # Регистрируем обработчики
+        self._register_handlers()
 
-def clear_history(user_id: int):
-    if user_id in user_histories:
-        del user_histories[user_id]
-    if user_id in user_facts:
-        del user_facts[user_id]
+    def _register_handlers(self) -> None:
+        """Регистрирует все обработчики сообщений."""
+        @self.bot.message_handler(commands=['start'])
+        def start_handler(message):
+            self._send_welcome(message)
 
-def update_facts(user_id: int, user_message: str):
-    facts = user_facts.get(user_id, {})
-    if not facts.get('profession'):
-        professions = ['программист', 'менеджер', 'дизайнер', 'бухгалтер', 'инженер', 'учитель', 'водитель', 'юрист', 'маркетолог', 'строитель', 'врач']
-        for p in professions:
-            if p in user_message.lower():
-                facts['profession'] = p.capitalize()
-                break
-    if not facts.get('age'):
-        ages = re.findall(r'\b([1-9][0-9]?)\b', user_message)
-        for a in ages:
-            age = int(a)
-            if 18 <= age <= 99:
-                facts['age'] = age
-                break
-    if not facts.get('nationality'):
-        nations = ['русский', 'украинец', 'белорус', 'армянин', 'грузин', 'татарин', 'немец', 'француз', 'итальянец', 'испанец', 'китаец', 'американец', 'казах']
-        for n in nations:
-            if n in user_message.lower():
-                facts['nationality'] = n.capitalize()
-                break
-    if facts.get('agreed') is None:
-        if any(w in user_message.lower() for w in ['да', 'пойду', 'хочу', 'конечно', 'согласен', 'давай']):
-            facts['agreed'] = True
-        elif any(w in user_message.lower() for w in ['нет', 'не пойду', 'не хочу', 'отказ', 'не могу']):
-            facts['agreed'] = False
-    user_facts[user_id] = facts
+        @self.bot.message_handler(commands=['reset'])
+        def reset_handler(message):
+            self._reset_dialog(message)
 
-def get_facts_context(user_id: int) -> str:
-    facts = user_facts.get(user_id, {})
-    known = []
-    if facts.get('profession'):
-        known.append(f"профессия: {facts['profession']}")
-    if facts.get('age'):
-        known.append(f"возраст: {facts['age']}")
-    if facts.get('nationality'):
-        known.append(f"национальность: {facts['nationality']}")
-    if facts.get('agreed') is not None:
-        known.append("согласие на выпивку: " + ("да" if facts['agreed'] else "нет"))
-    if known:
-        return "Известная информация о собеседнике: " + ", ".join(known) + "."
-    return ""
+        @self.bot.message_handler(func=lambda msg: True)
+        def text_handler(message):
+            self._handle_text(message)
 
-def get_groq_response(user_id: int, user_message: str) -> str:
-    update_facts(user_id, user_message)
-    update_history(user_id, "user", user_message)
-    facts_context = get_facts_context(user_id)
-    messages = [{"role": "system", "content": SYSTEM_PROMPT}]
-    if facts_context:
-        messages.append({"role": "system", "content": facts_context})
-    messages.extend(get_history(user_id))
-    try:
-        completion = groq_client.chat.completions.create(
-            model=MODEL_NAME,
-            messages=messages,
-            temperature=0.8,
-            max_tokens=250,
+    # ---------- РАБОТА С ИСТОРИЕЙ ----------
+    def _get_history(self, user_id: int) -> List[Dict[str, str]]:
+        return self.user_histories.get(user_id, [])
+
+    def _update_history(self, user_id: int, role: str, content: str) -> None:
+        history = self.user_histories.get(user_id, [])
+        history.append({"role": role, "content": content})
+        if len(history) > MAX_HISTORY:
+            history = history[-MAX_HISTORY:]
+        self.user_histories[user_id] = history
+
+    def _clear_history(self, user_id: int) -> None:
+        self.user_histories.pop(user_id, None)
+        self.user_facts.pop(user_id, None)
+
+    # ---------- ИЗВЛЕЧЕНИЕ ФАКТОВ ----------
+    def _update_facts(self, user_id: int, message: str) -> None:
+        """Парсит сообщение пользователя и заполняет известные факты."""
+        facts = self.user_facts.get(user_id, {})
+        lower_msg = message.lower()
+
+        # Профессия – ищем по ключевым словам
+        if not facts.get('profession'):
+            professions = [
+                'программист', 'менеджер', 'дизайнер', 'бухгалтер', 'инженер',
+                'учитель', 'водитель', 'юрист', 'маркетолог', 'строитель', 'врач'
+            ]
+            for p in professions:
+                if p in lower_msg:
+                    facts['profession'] = p.capitalize()
+                    break
+
+        # Возраст – ищем число от 18 до 99
+        if not facts.get('age'):
+            age_match = re.search(r'\b([1-9][0-9]?)\b', message)
+            if age_match:
+                age = int(age_match.group(1))
+                if 18 <= age <= 99:
+                    facts['age'] = age
+
+        # Национальность – по списку
+        if not facts.get('nationality'):
+            nations = [
+                'русский', 'украинец', 'белорус', 'армянин', 'грузин',
+                'татарин', 'немец', 'француз', 'итальянец', 'испанец',
+                'китаец', 'американец', 'казах'
+            ]
+            for n in nations:
+                if n in lower_msg:
+                    facts['nationality'] = n.capitalize()
+                    break
+
+        # Согласие на выпивку – проверяем явные маркеры
+        if facts.get('agreed') is None:
+            if any(w in lower_msg for w in ['да', 'пойду', 'хочу', 'конечно', 'согласен', 'давай']):
+                facts['agreed'] = True
+            elif any(w in lower_msg for w in ['нет', 'не пойду', 'не хочу', 'отказ', 'не могу']):
+                facts['agreed'] = False
+
+        self.user_facts[user_id] = facts
+
+    def _get_facts_context(self, user_id: int) -> str:
+        """Формирует строку с уже известными фактами для подсказки модели."""
+        facts = self.user_facts.get(user_id, {})
+        known = []
+        if facts.get('profession'):
+            known.append(f"профессия: {facts['profession']}")
+        if facts.get('age'):
+            known.append(f"возраст: {facts['age']}")
+        if facts.get('nationality'):
+            known.append(f"национальность: {facts['nationality']}")
+        if facts.get('agreed') is not None:
+            known.append("согласие на выпивку: " + ("да" if facts['agreed'] else "нет"))
+        return "Известная информация о собеседнике: " + ", ".join(known) + "." if known else ""
+
+    # ---------- ОБРАЩЕНИЕ К GROQ ----------
+    def _get_groq_response(self, user_id: int, user_message: str) -> str:
+        """Отправляет запрос в Groq и возвращает ответ."""
+        self._update_facts(user_id, user_message)
+        self._update_history(user_id, "user", user_message)
+
+        messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+        facts_context = self._get_facts_context(user_id)
+        if facts_context:
+            messages.append({"role": "system", "content": facts_context})
+        messages.extend(self._get_history(user_id))
+
+        try:
+            completion = self.groq_client.chat.completions.create(
+                model=MODEL_NAME,
+                messages=messages,
+                temperature=0.8,
+                max_tokens=250,
+            )
+            reply = completion.choices[0].message.content
+            self._update_history(user_id, "assistant", reply)
+            return reply
+        except Exception as e:
+            logging.error(f"Ошибка Groq: {e}")
+            return "😅 Что-то пошло не так… Давай попробуем ещё раз?"
+
+    # ---------- ОБРАБОТЧИКИ СООБЩЕНИЙ ----------
+    def _send_welcome(self, message):
+        user_id = message.from_user.id
+        self._clear_history(user_id)
+        welcome = (
+            "Привет! 👋 Я Алина, 26 лет, бухгалтер. "
+            "Ищу компанию, чтобы сегодня вечером выпить. Расскажи немного о себе 😉"
         )
-        reply = completion.choices[0].message.content
-        update_history(user_id, "assistant", reply)
-        return reply
-    except Exception as e:
-        logging.error(f"Ошибка Groq: {e}")
-        return "😅 Что-то пошло не так… Давай попробуем ещё раз?"
+        self.bot.reply_to(message, welcome)
+        self._update_history(user_id, "assistant", welcome)
 
-@bot.message_handler(commands=['start'])
-def send_welcome(message):
-    user_id = message.from_user.id
-    clear_history(user_id)
-    welcome_text = (
-        "Привет! 👋 Я Алина, 26 лет, бухгалтер. "
-        "Ищу компанию, чтобы сегодня вечером выпить. Расскажи немного о себе 😉"
-    )
-    bot.reply_to(message, welcome_text)
-    update_history(user_id, "assistant", welcome_text)
+    def _reset_dialog(self, message):
+        user_id = message.from_user.id
+        self._clear_history(user_id)
+        self.bot.reply_to(message, "Диалог сброшен. Давай начнём заново! 👋")
 
-@bot.message_handler(commands=['reset'])
-def reset_dialog(message):
-    user_id = message.from_user.id
-    clear_history(user_id)
-    bot.reply_to(message, "Диалог сброшен. Давай начнём заново! 👋")
+    def _handle_text(self, message):
+        user_id = message.from_user.id
+        user_text = message.text
 
-@bot.message_handler(func=lambda msg: True)
-def handle_message(message):
-    user_id = message.from_user.id
-    user_text = message.text
-    if user_id not in user_histories or len(user_histories[user_id]) == 0:
-        send_welcome(message)
-    reply = get_groq_response(user_id, user_text)
-    delay = random.uniform(MIN_DELAY, MAX_DELAY)
-    time.sleep(delay)
-    bot.reply_to(message, reply)
+        # Если истории нет – автоматически приветствуем
+        if user_id not in self.user_histories or not self.user_histories[user_id]:
+            self._send_welcome(message)
+            # После приветствия продолжаем обработку введённого текста
+            # (чтобы не дублировать приветствие, можно просто вызвать ответ)
+            # Но лучше позволить боту ответить на первое сообщение после приветствия.
+            # Однако send_welcome уже добавил assistant-сообщение в историю,
+            # поэтому повторно приветствие не отправится.
 
+        reply = self._get_groq_response(user_id, user_text)
+        self.bot.reply_to(message, reply)
+
+    # ---------- ЗАПУСК ----------
+    def run(self):
+        logging.basicConfig(level=logging.INFO)
+        print("Бот Алина запущен...")
+        try:
+            self.bot.infinity_polling()
+        except Exception as e:
+            logging.error(f"Критическая ошибка в polling: {e}")
+            raise
+
+# -------- ТОЧКА ВХОДА ----------
 if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO)
-    print("Бот Алина запущен...")
-    bot.infinity_polling()
+    bot_instance = AlinaBot(TELEGRAM_TOKEN, GROQ_API_KEY)
+    bot_instance.run()
