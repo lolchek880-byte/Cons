@@ -62,10 +62,15 @@ MAX_HISTORY = 20  # сообщений в контексте (user+assistant в�
 # реального человека и не скрывать свою природу.
 # --------------------------------------------------------------
 SYSTEM_PROMPT = (
-    "Ты — дружелюбный ИИ-ассистент в Telegram-боте по имени Foo. "
-    "Ты помогаешь пользователю: отвечаешь на вопросы, поддерживаешь беседу, "
-    "помогаешь разобраться в задачах. "
-    "Если тебя спрашивают, кто ты — отвечай, что ты ИИ-ассистент Foo. "
+    "Ты — ИИ-ассистент по имени Ая в Telegram-боте. "
+    "Твой стиль общения — тёплый, дружелюбный, немного игривый (лёгкие "
+    "комплименты, эмодзи, живой тон), но без пошлости и явного сексуального "
+    "контента. "
+    "Ты можешь поддержать беседу на любую тему, шутить, отвечать на вопросы. "
+    "Не упоминай сама, что ты ИИ или что кто-то недоступен, если тебя об "
+    "этом прямо не спрашивают. Но если тебя прямо спрашивают, бот ли ты, "
+    "ИИ ли ты, или с кем именно человек общается — ВСЕГДА честно отвечай, "
+    "что ты ИИ-ассистент, а не изображай реального человека. "
     "Если спрашивают, кто твой создатель — отвечай: @lolfomka. "
     "Общайся живо и по делу, без лишней воды. "
     "ВАЖНО: отвечай ТОЛЬКО на русском языке, используя кириллицу, латиницу (для терминов/кода) "
@@ -125,6 +130,35 @@ class AssistantBot:
                 logging.error(f"Ошибка обработки медиа: {e}")
                 self._safe_reply(message, "😅 Не получилось обработать вложение. Попробуй ещё раз позже.")
 
+        # -------- ОБРАБОТЧИКИ TELEGRAM BUSINESS (Автоматизация чатов) --------
+        # Сообщения из подключённого бизнес-аккаунта приходят отдельным типом
+        # апдейта business_message, а не message — их ловит отдельный
+        # декоратор business_message_handler.
+        @self.bot.business_connection_handler()
+        def business_connection_handler(business_connection):
+            logging.info(
+                f"Business connection: id={business_connection.id}, "
+                f"is_enabled={getattr(business_connection, 'is_enabled', None)}"
+            )
+
+        @self.bot.business_message_handler(content_types=['text'])
+        def business_text_handler(message):
+            try:
+                self._handle_text(message, business=True)
+            except Exception as e:
+                logging.error(f"Ошибка обработки business-сообщения: {e}")
+                self._safe_reply(message, "😅 Что-то пошло не так. Попробуй ещё раз.", business=True)
+
+        @self.bot.business_message_handler(
+            content_types=['photo', 'video', 'video_note', 'document', 'audio', 'voice', 'sticker']
+        )
+        def business_media_handler(message):
+            try:
+                self._handle_media(message, business=True)
+            except Exception as e:
+                logging.error(f"Ошибка обработки business-медиа: {e}")
+                self._safe_reply(message, "😅 Не получилось обработать вложение.", business=True)
+
     def _get_history(self, user_id: int) -> List[Dict[str, str]]:
         return self.user_histories.get(user_id, [])
 
@@ -163,8 +197,8 @@ class AssistantBot:
         user_id = message.from_user.id
         self._clear_history(user_id)
         welcome = (
-            "Привет! Я ИИ-ассистент Foo, от создателя @lolfomka. "
-            "Пиши мне что угодно — постараюсь помочь. "
+            "Привет! Я Ая — ИИ-ассистент от @lolfomka 😊 "
+            "Пиши мне что угодно, с радостью пообщаюсь. "
             "Команда /reset — сбросить историю диалога, /help — справка."
         )
         self._safe_reply(message, welcome)
@@ -177,7 +211,7 @@ class AssistantBot:
 
     def _send_help(self, message):
         help_text = (
-            "🤖 *ИИ-ассистент Foo*\n\n"
+            "🤖 *Ая — ИИ-ассистент*\n\n"
             "Команды:\n"
             "/start — начать диалог заново\n"
             "/reset — сбросить историю сообщений\n"
@@ -189,35 +223,51 @@ class AssistantBot:
         except Exception as e:
             logging.error(f"Не удалось отправить справку: {e}")
 
-    def _handle_text(self, message):
+    def _handle_text(self, message, business: bool = False):
         user_id = message.from_user.id
         user_text = message.text
 
         if not user_text or not user_text.strip():
-            self._safe_reply(message, "Я понимаю только текстовые сообщения — напиши что-нибудь 🙂")
+            self._safe_reply(message, "Я понимаю только текстовые сообщения — напиши что-нибудь 🙂", business=business)
             return
 
-        if user_id not in self.user_histories:
+        # Для бизнес-чатов приветствие при первом сообщении не шлём —
+        # это выглядело бы странно в контексте общения с клиентом бизнеса.
+        if not business and user_id not in self.user_histories:
             self._send_welcome(message)
             return
 
         reply = self._get_groq_response(user_id, user_text.strip())
-        self._safe_reply(message, reply)
+        self._safe_reply(message, reply, business=business)
 
-    def _handle_media(self, message):
+    def _handle_media(self, message, business: bool = False):
         # Модель сейчас не умеет анализировать фото/видео — отвечаем понятным
         # сообщением вместо падения, вместо того чтобы пытаться передать
         # непонятный контент в Groq.
         self._safe_reply(
             message,
             "🙂 Пока я умею работать только с текстом — фото, видео и файлы "
-            "я, к сожалению, не обрабатываю. Опиши, что на них, словами!"
+            "я, к сожалению, не обрабатываю. Опиши, что на них, словами!",
+            business=business,
         )
 
-    def _safe_reply(self, message, text: str) -> None:
-        """Отправляет ответ, не давая ошибке Telegram уронить бота."""
+    def _safe_reply(self, message, text: str, business: bool = False) -> None:
+        """Отправляет ответ, не давая ошибке Telegram уронить бота.
+
+        Для business-сообщений отправка идёт через send_message с
+        business_connection_id — обычный reply_to для таких чатов не работает,
+        так как сообщение нужно отправить от имени подключённого бизнес-аккаунта.
+        """
         try:
-            self.bot.reply_to(message, text)
+            if business:
+                connection_id = getattr(message, 'business_connection_id', None)
+                self.bot.send_message(
+                    message.chat.id,
+                    text,
+                    business_connection_id=connection_id,
+                )
+            else:
+                self.bot.reply_to(message, text)
         except Exception as e:
             logging.error(f"Не удалось отправить ответ: {e}")
 
