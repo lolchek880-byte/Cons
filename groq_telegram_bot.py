@@ -37,9 +37,14 @@ load_dotenv()
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+# Публичный username канала, на который нужно подписаться, например: "@mychannel"
+REQUIRED_CHANNEL = os.getenv("REQUIRED_CHANNEL")
 
 if not TELEGRAM_TOKEN or not GROQ_API_KEY:
     raise ValueError("Не найдены TELEGRAM_TOKEN или GROQ_API_KEY в переменных окружения (.env)")
+
+if REQUIRED_CHANNEL and not REQUIRED_CHANNEL.startswith("@"):
+    REQUIRED_CHANNEL = "@" + REQUIRED_CHANNEL
 
 # -------- УДАЛЯЕМ ВЕБХУК ПЕРЕД POLLING ----------
 try:
@@ -104,7 +109,18 @@ class AssistantBot:
     def _register_handlers(self) -> None:
         @self.bot.message_handler(commands=['start'])
         def start_handler(message):
+            if not self._is_subscribed(message.from_user.id):
+                self._send_subscribe_prompt(message)
+                return
             self._send_welcome(message)
+
+        @self.bot.callback_query_handler(func=lambda call: call.data == "check_subscription")
+        def check_subscription_callback(call):
+            if self._is_subscribed(call.from_user.id):
+                self.bot.answer_callback_query(call.id, "Подписка подтверждена ✅")
+                self.bot.send_message(call.message.chat.id, "Спасибо за подписку! Теперь можно общаться 🙂")
+            else:
+                self.bot.answer_callback_query(call.id, "Не вижу подписки 😕 Попробуй ещё раз через пару секунд.", show_alert=True)
 
         @self.bot.message_handler(commands=['reset'])
         def reset_handler(message):
@@ -160,6 +176,38 @@ class AssistantBot:
             except Exception as e:
                 logging.error(f"Ошибка обработки business-медиа: {e}")
                 self._safe_reply(message, "😅 Не получилось обработать вложение.", business=True)
+
+    # -------- ПРОВЕРКА ПОДПИСКИ НА КАНАЛ --------
+    def _is_subscribed(self, user_id: int) -> bool:
+        """Проверяет, состоит ли пользователь в REQUIRED_CHANNEL.
+
+        Бот должен быть добавлен в канал администратором, иначе Telegram
+        не даст получить статус участника.
+        """
+        if not REQUIRED_CHANNEL:
+            return True  # проверка отключена, если канал не задан
+        try:
+            member = self.bot.get_chat_member(REQUIRED_CHANNEL, user_id)
+            return member.status in ("member", "administrator", "creator")
+        except Exception as e:
+            logging.error(f"Не удалось проверить подписку для {user_id}: {e}")
+            # Если проверить не получилось (например, бот не админ канала) —
+            # не блокируем пользователя наглухо, чтобы бот не встал колом.
+            return True
+
+    def _send_subscribe_prompt(self, message) -> None:
+        channel_link = f"https://t.me/{REQUIRED_CHANNEL.lstrip('@')}"
+        markup = telebot.types.InlineKeyboardMarkup()
+        markup.add(telebot.types.InlineKeyboardButton("📢 Подписаться", url=channel_link))
+        markup.add(telebot.types.InlineKeyboardButton("✅ Я подписался", callback_data="check_subscription"))
+        text = (
+            f"Чтобы пользоваться ботом, подпишись на канал {REQUIRED_CHANNEL} 🙏\n\n"
+            "После подписки нажми «Я подписался»."
+        )
+        try:
+            self.bot.send_message(message.chat.id, text, reply_markup=markup)
+        except Exception as e:
+            logging.error(f"Не удалось отправить запрос подписки: {e}")
 
     def _get_history(self, user_id: int) -> List[Dict[str, str]]:
         return self.user_histories.get(user_id, [])
@@ -247,6 +295,10 @@ class AssistantBot:
 
         self._log_incoming(message, business)
 
+        if not business and not self._is_subscribed(user_id):
+            self._send_subscribe_prompt(message)
+            return
+
         if not user_text or not user_text.strip():
             self._safe_reply(message, "Я понимаю только текстовые сообщения — напиши что-нибудь 🙂", business=business)
             return
@@ -263,6 +315,10 @@ class AssistantBot:
 
     def _handle_media(self, message, business: bool = False):
         self._log_incoming(message, business)
+
+        if not business and not self._is_subscribed(message.from_user.id):
+            self._send_subscribe_prompt(message)
+            return
         # Модель сейчас не умеет анализировать фото/видео — отвечаем понятным
         # сообщением вместо падения, вместо того чтобы пытаться передать
         # непонятный контент в Groq.
