@@ -3,6 +3,7 @@ import sys
 import subprocess
 import logging
 import time
+import re
 from typing import Dict, List
 
 # -------- АВТОУСТАНОВКА БИБЛИОТЕК ----------
@@ -61,15 +62,29 @@ MAX_HISTORY = 20  # сообщений в контексте (user+assistant в�
 # реального человека и не скрывать свою природу.
 # --------------------------------------------------------------
 SYSTEM_PROMPT = (
-    "Ты — дружелюбный ИИ-ассистент в Telegram-боте. "
+    "Ты — дружелюбный ИИ-ассистент в Telegram-боте по имени Foo. "
     "Ты помогаешь пользователю: отвечаешь на вопросы, поддерживаешь беседу, "
     "помогаешь разобраться в задачах. "
-    "Если тебя спрашивают, бот ли ты или ИИ — всегда честно подтверждай это. "
-    "Общайся живо и по делу, без лишней воды."
-    "Если кто-то будет спрашивать кто ты, ты Foo ai"
-    "Если кто-то будет спрашивать кто твой создатель, отвечай @lolfomka"
-    
+    "Если тебя спрашивают, кто ты — отвечай, что ты ИИ-ассистент Foo. "
+    "Если спрашивают, кто твой создатель — отвечай: @lolfomka. "
+    "Общайся живо и по делу, без лишней воды. "
+    "ВАЖНО: отвечай ТОЛЬКО на русском языке, используя кириллицу, латиницу (для терминов/кода) "
+    "и стандартную пунктуацию. Никогда не вставляй иероглифы (китайские, японские, корейские) "
+    "или символы других алфавитов, если пользователь явно не попросил перевод или текст на другом языке."
 )
+
+# Диапазоны символов, которые не должны появляться в обычном ответе
+# (китайский/японский/корейский), — страховка на случай сбоя модели.
+_FOREIGN_CHARS_PATTERN = re.compile(
+    r'[\u4e00-\u9fff\u3040-\u30ff\u31f0-\u31ff\uac00-\ud7af]'
+)
+
+
+def _strip_foreign_chars(text: str) -> str:
+    """Убирает случайно вставленные иероглифы CJK из ответа модели."""
+    if not text:
+        return text
+    return _FOREIGN_CHARS_PATTERN.sub('', text)
 
 
 class AssistantBot:
@@ -94,7 +109,21 @@ class AssistantBot:
 
         @self.bot.message_handler(func=lambda msg: True, content_types=['text'])
         def text_handler(message):
-            self._handle_text(message)
+            try:
+                self._handle_text(message)
+            except Exception as e:
+                logging.error(f"Ошибка обработки текстового сообщения: {e}")
+                self._safe_reply(message, "😅 Что-то пошло не так. Попробуй ещё раз.")
+
+        @self.bot.message_handler(
+            content_types=['photo', 'video', 'video_note', 'document', 'audio', 'voice', 'sticker']
+        )
+        def media_handler(message):
+            try:
+                self._handle_media(message)
+            except Exception as e:
+                logging.error(f"Ошибка обработки медиа: {e}")
+                self._safe_reply(message, "😅 Не получилось обработать вложение. Попробуй ещё раз позже.")
 
     def _get_history(self, user_id: int) -> List[Dict[str, str]]:
         return self.user_histories.get(user_id, [])
@@ -123,6 +152,7 @@ class AssistantBot:
                 max_tokens=500,
             )
             reply = completion.choices[0].message.content
+            reply = _strip_foreign_chars(reply)
             self._update_history(user_id, "assistant", reply)
             return reply
         except Exception as e:
@@ -137,31 +167,34 @@ class AssistantBot:
             "Пиши мне что угодно — постараюсь помочь. "
             "Команда /reset — сбросить историю диалога, /help — справка."
         )
-        self.bot.reply_to(message, welcome)
+        self._safe_reply(message, welcome)
         self._update_history(user_id, "assistant", welcome)
 
     def _reset_dialog(self, message):
         user_id = message.from_user.id
         self._clear_history(user_id)
-        self.bot.reply_to(message, "Диалог сброшен, начинаем с чистого листа 🙂")
+        self._safe_reply(message, "Диалог сброшен, начинаем с чистого листа 🙂")
 
     def _send_help(self, message):
         help_text = (
-            "🤖 *ИИ-ассистент*\n\n"
+            "🤖 *ИИ-ассистент Foo*\n\n"
             "Команды:\n"
             "/start — начать диалог заново\n"
             "/reset — сбросить историю сообщений\n"
             "/help — эта справка\n\n"
             "Просто пиши сообщения — я отвечу."
         )
-        self.bot.reply_to(message, help_text, parse_mode='Markdown')
+        try:
+            self.bot.reply_to(message, help_text, parse_mode='Markdown')
+        except Exception as e:
+            logging.error(f"Не удалось отправить справку: {e}")
 
     def _handle_text(self, message):
         user_id = message.from_user.id
         user_text = message.text
 
         if not user_text or not user_text.strip():
-            self.bot.reply_to(message, "Я понимаю только текстовые сообщения — напиши что-нибудь 🙂")
+            self._safe_reply(message, "Я понимаю только текстовые сообщения — напиши что-нибудь 🙂")
             return
 
         if user_id not in self.user_histories:
@@ -169,17 +202,37 @@ class AssistantBot:
             return
 
         reply = self._get_groq_response(user_id, user_text.strip())
-        self.bot.reply_to(message, reply)
+        self._safe_reply(message, reply)
+
+    def _handle_media(self, message):
+        # Модель сейчас не умеет анализировать фото/видео — отвечаем понятным
+        # сообщением вместо падения, вместо того чтобы пытаться передать
+        # непонятный контент в Groq.
+        self._safe_reply(
+            message,
+            "🙂 Пока я умею работать только с текстом — фото, видео и файлы "
+            "я, к сожалению, не обрабатываю. Опиши, что на них, словами!"
+        )
+
+    def _safe_reply(self, message, text: str) -> None:
+        """Отправляет ответ, не давая ошибке Telegram уронить бота."""
+        try:
+            self.bot.reply_to(message, text)
+        except Exception as e:
+            logging.error(f"Не удалось отправить ответ: {e}")
 
     def run(self):
         logging.basicConfig(level=logging.INFO)
         print("Бот запущен...")
         print(f"Используется модель: {MODEL_NAME}")
-        try:
-            self.bot.infinity_polling()
-        except Exception as e:
-            logging.error(f"Критическая ошибка в polling: {e}")
-            raise
+        # non_stop + собственный retry: если polling всё же упадёт
+        # (обрыв сети и т.п.), бот перезапустится сам, а не умрёт насовсем.
+        while True:
+            try:
+                self.bot.infinity_polling(timeout=30, long_polling_timeout=30)
+            except Exception as e:
+                logging.error(f"Ошибка в polling, перезапуск через 5 секунд: {e}")
+                time.sleep(5)
 
 
 if __name__ == "__main__":
