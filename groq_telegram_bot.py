@@ -7,6 +7,7 @@ import re
 from typing import Dict, List
 
 # -------- АВТОУСТАНОВКА БИБЛИОТЕК ----------
+
 def install(package: str) -> None:
     subprocess.check_call([sys.executable, "-m", "pip", "install", package])
 
@@ -53,6 +54,7 @@ except Exception as e:
     print("Ошибка удаления вебхука:", e)
 
 # ============================================================
+
 MODEL_NAME = "llama-3.3-70b-versatile"
 MAX_HISTORY = 20  # сообщений в контексте (user+assistant вместе)
 
@@ -174,7 +176,6 @@ class AssistantBot:
 
     def _get_groq_response(self, user_id: int, user_message: str) -> str:
         self._update_history(user_id, "user", user_message)
-
         messages = [{"role": "system", "content": SYSTEM_PROMPT}]
         messages.extend(self._get_history(user_id))
 
@@ -223,9 +224,28 @@ class AssistantBot:
         except Exception as e:
             logging.error(f"Не удалось отправить справку: {e}")
 
+    # -------- ЛОГИРОВАНИЕ ВХОДЯЩИХ/ИСХОДЯЩИХ СООБЩЕНИЙ --------
+    @staticmethod
+    def _describe_user(message) -> str:
+        u = message.from_user
+        username = f"@{u.username}" if getattr(u, "username", None) else (u.first_name or "unknown")
+        return f"{username} (id={u.id})"
+
+    def _log_incoming(self, message, business: bool) -> None:
+        tag = "BUSINESS" if business else "CHAT"
+        who = self._describe_user(message)
+        logging.info(f"[{tag}] IN  | {who}: {message.text}")
+
+    def _log_outgoing(self, message, reply_text: str, business: bool) -> None:
+        tag = "BUSINESS" if business else "CHAT"
+        who = self._describe_user(message)
+        logging.info(f"[{tag}] OUT | -> {who}: {reply_text}")
+
     def _handle_text(self, message, business: bool = False):
         user_id = message.from_user.id
         user_text = message.text
+
+        self._log_incoming(message, business)
 
         if not user_text or not user_text.strip():
             self._safe_reply(message, "Я понимаю только текстовые сообщения — напиши что-нибудь 🙂", business=business)
@@ -238,9 +258,11 @@ class AssistantBot:
             return
 
         reply = self._get_groq_response(user_id, user_text.strip())
+        self._log_outgoing(message, reply, business)
         self._safe_reply(message, reply, business=business)
 
     def _handle_media(self, message, business: bool = False):
+        self._log_incoming(message, business)
         # Модель сейчас не умеет анализировать фото/видео — отвечаем понятным
         # сообщением вместо падения, вместо того чтобы пытаться передать
         # непонятный контент в Groq.
@@ -272,9 +294,16 @@ class AssistantBot:
             logging.error(f"Не удалось отправить ответ: {e}")
 
     def run(self):
-        logging.basicConfig(level=logging.INFO)
+        logging.basicConfig(
+            level=logging.INFO,
+            format="%(asctime)s | %(levelname)s | %(message)s",
+            handlers=[
+                logging.StreamHandler(sys.stdout),  # видно в логах Railway
+            ],
+        )
         print("Бот запущен...")
         print(f"Используется модель: {MODEL_NAME}")
+
         # non_stop + собственный retry: если polling всё же упадёт
         # (обрыв сети и т.п.), бот перезапустится сам, а не умрёт насовсем.
         while True:
