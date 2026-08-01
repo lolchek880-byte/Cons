@@ -2,6 +2,7 @@ import os
 import sys
 import subprocess
 import logging
+import threading
 import time
 import re
 from typing import Dict, List
@@ -32,6 +33,13 @@ except ImportError:
     install("python-dotenv")
     from dotenv import load_dotenv
 
+try:
+    from flask import Flask, request
+except ImportError:
+    print("Устанавливаем Flask...")
+    install("flask")
+    from flask import Flask, request
+
 # -------- ЗАГРУЗКА ПЕРЕМЕННЫХ ----------
 load_dotenv()
 
@@ -39,24 +47,28 @@ TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 # Публичный username канала, на который нужно подписаться, например: "@mychannel"
 REQUIRED_CHANNEL = os.getenv("REQUIRED_CHANNEL")
+# Публичный HTTPS-адрес сервиса на Railway, например:
+# https://my-bot-production.up.railway.app  (без слэша в конце)
+WEBHOOK_HOST = os.getenv("WEBHOOK_HOST")
+PORT = int(os.getenv("PORT", "8080"))
 
 if not TELEGRAM_TOKEN or not GROQ_API_KEY:
     raise ValueError("Не найдены TELEGRAM_TOKEN или GROQ_API_KEY в переменных окружения (.env)")
 
+if not WEBHOOK_HOST:
+    raise ValueError(
+        "Не найден WEBHOOK_HOST в переменных окружения. "
+        "Укажи публичный адрес сервиса Railway, например: "
+        "https://my-bot-production.up.railway.app"
+    )
+
 if REQUIRED_CHANNEL and not REQUIRED_CHANNEL.startswith("@"):
     REQUIRED_CHANNEL = "@" + REQUIRED_CHANNEL
 
-# -------- УДАЛЯЕМ ВЕБХУК ПЕРЕД POLLING ----------
-try:
-    import requests
-    for _ in range(3):
-        resp = requests.get(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/deleteWebhook")
-        if resp.status_code == 200:
-            print("Webhook удалён:", resp.json())
-            break
-        time.sleep(1)
-except Exception as e:
-    print("Ошибка удаления вебхука:", e)
+# Секретный путь для вебхука — чтобы никто посторонний не мог слать
+# на этот адрес поддельные апдейты, используем сам токен как часть пути.
+WEBHOOK_PATH = f"/webhook/{TELEGRAM_TOKEN}"
+WEBHOOK_URL = f"{WEBHOOK_HOST.rstrip('/')}{WEBHOOK_PATH}"
 
 # ============================================================
 
@@ -99,18 +111,21 @@ class AssistantBot:
         self.groq_client = groq.Groq(api_key=groq_api_key)
         self.user_histories: Dict[int, List[Dict[str, str]]] = {}
         # Защита от повторной обработки одного и того же апдейта —
-        # на случай, если параллельно поднимется второй инстанс бота.
+        # Telegram иногда повторно доставляет апдейт, если не получил
+        # вовремя 200 OK от вебхука.
         self._processed_update_ids: set = set()
+        self._dedup_lock = threading.Lock()
         self._register_handlers()
 
     def _already_processed(self, message) -> bool:
         key = (message.chat.id, message.message_id)
-        if key in self._processed_update_ids:
-            return True
-        self._processed_update_ids.add(key)
-        if len(self._processed_update_ids) > 2000:
-            # не даём множеству расти бесконечно
-            self._processed_update_ids = set(list(self._processed_update_ids)[-1000:])
+        with self._dedup_lock:
+            if key in self._processed_update_ids:
+                return True
+            self._processed_update_ids.add(key)
+            if len(self._processed_update_ids) > 2000:
+                # не даём множеству расти бесконечно
+                self._processed_update_ids = set(list(self._processed_update_ids)[-1000:])
         return False
 
     def _register_handlers(self) -> None:
@@ -323,15 +338,33 @@ class AssistantBot:
         )
         print("Бот запущен...")
         print(f"Используется модель: {MODEL_NAME}")
+        print(f"Webhook URL: {WEBHOOK_URL}")
 
-        # non_stop + собственный retry: если polling всё же упадёт
-        # (обрыв сети и т.п.), бот перезапустится сам, а не умрёт насовсем.
-        while True:
-            try:
-                self.bot.infinity_polling(timeout=30, long_polling_timeout=30)
-            except Exception as e:
-                logging.error(f"Ошибка в polling, перезапуск через 5 секунд: {e}")
-                time.sleep(5)
+        # Снимаем возможный старый вебхук/polling и ставим новый.
+        # drop_pending_updates=True — не пытаемся обработать то, что
+        # накопилось, пока бот был выключен (иначе после простоя
+        # прилетит пачка старых сообщений разом).
+        self.bot.remove_webhook()
+        time.sleep(1)
+        self.bot.set_webhook(url=WEBHOOK_URL, drop_pending_updates=True)
+
+        app = Flask(__name__)
+
+        @app.route(WEBHOOK_PATH, methods=['POST'])
+        def telegram_webhook():
+            if request.headers.get('content-type') == 'application/json':
+                json_string = request.get_data().decode('utf-8')
+                update = telebot.types.Update.de_json(json_string)
+                self.bot.process_new_updates([update])
+                return '', 200
+            return '', 403
+
+        @app.route('/', methods=['GET'])
+        def health_check():
+            # Простой эндпоинт, чтобы Railway видел, что сервис жив.
+            return 'OK', 200
+
+        app.run(host='0.0.0.0', port=PORT)
 
 
 if __name__ == "__main__":
