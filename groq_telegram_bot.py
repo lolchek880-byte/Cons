@@ -98,7 +98,20 @@ class AssistantBot:
         self.bot = telebot.TeleBot(token)
         self.groq_client = groq.Groq(api_key=groq_api_key)
         self.user_histories: Dict[int, List[Dict[str, str]]] = {}
+        # Защита от повторной обработки одного и того же апдейта —
+        # на случай, если параллельно поднимется второй инстанс бота.
+        self._processed_update_ids: set = set()
         self._register_handlers()
+
+    def _already_processed(self, message) -> bool:
+        key = (message.chat.id, message.message_id)
+        if key in self._processed_update_ids:
+            return True
+        self._processed_update_ids.add(key)
+        if len(self._processed_update_ids) > 2000:
+            # не даём множеству расти бесконечно
+            self._processed_update_ids = set(list(self._processed_update_ids)[-1000:])
+        return False
 
     def _register_handlers(self) -> None:
         @self.bot.message_handler(commands=['start'])
@@ -126,6 +139,8 @@ class AssistantBot:
 
         @self.bot.message_handler(func=lambda msg: True, content_types=['text'])
         def text_handler(message):
+            if self._already_processed(message):
+                return
             try:
                 self._handle_text(message)
             except Exception as e:
@@ -136,40 +151,13 @@ class AssistantBot:
             content_types=['photo', 'video', 'video_note', 'document', 'audio', 'voice', 'sticker']
         )
         def media_handler(message):
+            if self._already_processed(message):
+                return
             try:
                 self._handle_media(message)
             except Exception as e:
                 logging.error(f"Ошибка обработки медиа: {e}")
                 self._safe_reply(message, "😅 Не получилось обработать вложение. Попробуй ещё раз позже.")
-
-        # -------- ОБРАБОТЧИКИ TELEGRAM BUSINESS (Автоматизация чатов) --------
-        # Сообщения из подключённого бизнес-аккаунта приходят отдельным типом
-        # апдейта business_message, а не message — их ловит отдельный
-        # декоратор business_message_handler.
-        @self.bot.business_connection_handler()
-        def business_connection_handler(business_connection):
-            logging.info(
-                f"Business connection: id={business_connection.id}, "
-                f"is_enabled={getattr(business_connection, 'is_enabled', None)}"
-            )
-
-        @self.bot.business_message_handler(content_types=['text'])
-        def business_text_handler(message):
-            try:
-                self._handle_text(message, business=True)
-            except Exception as e:
-                logging.error(f"Ошибка обработки business-сообщения: {e}")
-                self._safe_reply(message, "😅 Что-то пошло не так. Попробуй ещё раз.", business=True)
-
-        @self.bot.business_message_handler(
-            content_types=['photo', 'video', 'video_note', 'document', 'audio', 'voice', 'sticker']
-        )
-        def business_media_handler(message):
-            try:
-                self._handle_media(message, business=True)
-            except Exception as e:
-                logging.error(f"Ошибка обработки business-медиа: {e}")
-                self._safe_reply(message, "😅 Не получилось обработать вложение.", business=True)
 
     # -------- ПРОВЕРКА ПОДПИСКИ НА КАНАЛ --------
     def _is_subscribed(self, user_id: int) -> bool:
@@ -273,44 +261,40 @@ class AssistantBot:
         username = f"@{u.username}" if getattr(u, "username", None) else (u.first_name or "unknown")
         return f"{username} (id={u.id})"
 
-    def _log_incoming(self, message, business: bool) -> None:
-        tag = "BUSINESS" if business else "CHAT"
+    def _log_incoming(self, message) -> None:
         who = self._describe_user(message)
-        logging.info(f"[{tag}] IN  | {who}: {message.text}")
+        logging.info(f"IN  | {who}: {message.text}")
 
-    def _log_outgoing(self, message, reply_text: str, business: bool) -> None:
-        tag = "BUSINESS" if business else "CHAT"
+    def _log_outgoing(self, message, reply_text: str) -> None:
         who = self._describe_user(message)
-        logging.info(f"[{tag}] OUT | -> {who}: {reply_text}")
+        logging.info(f"OUT | -> {who}: {reply_text}")
 
-    def _handle_text(self, message, business: bool = False):
+    def _handle_text(self, message):
         user_id = message.from_user.id
         user_text = message.text
 
-        self._log_incoming(message, business)
+        self._log_incoming(message)
 
-        if not business and not self._is_subscribed(user_id):
+        if not self._is_subscribed(user_id):
             self._send_subscribe_prompt(message)
             return
 
         if not user_text or not user_text.strip():
-            self._safe_reply(message, "Я понимаю только текстовые сообщения — напиши что-нибудь 🙂", business=business)
+            self._safe_reply(message, "Я понимаю только текстовые сообщения — напиши что-нибудь 🙂")
             return
 
-        # Для бизнес-чатов приветствие при первом сообщении не шлём —
-        # это выглядело бы странно в контексте общения с клиентом бизнеса.
-        if not business and user_id not in self.user_histories:
+        if user_id not in self.user_histories:
             self._send_welcome(message)
             return
 
         reply = self._get_groq_response(user_id, user_text.strip())
-        self._log_outgoing(message, reply, business)
-        self._safe_reply(message, reply, business=business)
+        self._log_outgoing(message, reply)
+        self._safe_reply(message, reply)
 
-    def _handle_media(self, message, business: bool = False):
-        self._log_incoming(message, business)
+    def _handle_media(self, message):
+        self._log_incoming(message)
 
-        if not business and not self._is_subscribed(message.from_user.id):
+        if not self._is_subscribed(message.from_user.id):
             self._send_subscribe_prompt(message)
             return
         # Модель сейчас не умеет анализировать фото/видео — отвечаем понятным
@@ -320,26 +304,12 @@ class AssistantBot:
             message,
             "🙂 Пока я умею работать только с текстом — фото, видео и файлы "
             "я, к сожалению, не обрабатываю. Опиши, что на них, словами!",
-            business=business,
         )
 
-    def _safe_reply(self, message, text: str, business: bool = False) -> None:
-        """Отправляет ответ, не давая ошибке Telegram уронить бота.
-
-        Для business-сообщений отправка идёт через send_message с
-        business_connection_id — обычный reply_to для таких чатов не работает,
-        так как сообщение нужно отправить от имени подключённого бизнес-аккаунта.
-        """
+    def _safe_reply(self, message, text: str) -> None:
+        """Отправляет ответ, не давая ошибке Telegram уронить бота."""
         try:
-            if business:
-                connection_id = getattr(message, 'business_connection_id', None)
-                self.bot.send_message(
-                    message.chat.id,
-                    text,
-                    business_connection_id=connection_id,
-                )
-            else:
-                self.bot.reply_to(message, text)
+            self.bot.reply_to(message, text)
         except Exception as e:
             logging.error(f"Не удалось отправить ответ: {e}")
 
