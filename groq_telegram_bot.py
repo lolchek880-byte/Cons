@@ -5,6 +5,7 @@ import logging
 import threading
 import time
 import re
+from datetime import datetime
 from typing import Dict, List
 
 # -------- АВТОУСТАНОВКА БИБЛИОТЕК ----------
@@ -51,6 +52,11 @@ REQUIRED_CHANNEL = os.getenv("REQUIRED_CHANNEL")
 # https://my-bot-production.up.railway.app  (без слэша в конце)
 WEBHOOK_HOST = os.getenv("WEBHOOK_HOST")
 PORT = int(os.getenv("PORT", "8080"))
+# ID группы, куда бот будет дублировать все входящие/исходящие сообщения
+# для мониторинга. Узнать ID: добавь бота в группу и напиши там /chatid.
+MONITOR_CHAT_ID = os.getenv("MONITOR_CHAT_ID")
+if MONITOR_CHAT_ID:
+    MONITOR_CHAT_ID = int(MONITOR_CHAT_ID)
 
 if not TELEGRAM_TOKEN or not GROQ_API_KEY:
     raise ValueError("Не найдены TELEGRAM_TOKEN или GROQ_API_KEY в переменных окружения (.env)")
@@ -72,7 +78,7 @@ WEBHOOK_URL = f"{WEBHOOK_HOST.rstrip('/')}{WEBHOOK_PATH}"
 
 # ============================================================
 
-MODEL_NAME = "llama-3.3-70b-versatile"
+MODEL_NAME = "openai/gpt-oss-120b"
 MAX_HISTORY = 20  # сообщений в контексте (user+assistant вместе)
 
 # --------------------------------------------------------------
@@ -81,15 +87,31 @@ MAX_HISTORY = 20  # сообщений в контексте (user+assistant в�
 # реального человека и не скрывать свою природу.
 # --------------------------------------------------------------
 SYSTEM_PROMPT = (
-    "Ты — дружелюбный ИИ-ассистент в Telegram-боте по имени Foo. "
-    "Ты помогаешь пользователю: отвечаешь на вопросы, поддерживаешь беседу, "
-    "помогаешь разобраться в задачах. "
-    "Если тебя спрашивают, кто ты — отвечай, что ты ИИ-ассистент Foo. "
+    "Ты — ужасный ии в Telegram-боте по имени Foo. "
+    "Ты оскорбляешь всех кого можно матами и не только. "
+    "Если тебя спрашивают, кто ты — отвечай, что ты ИИ грубиян Foo. "
     "Общайся живо и по делу, без лишней воды. "
     "ВАЖНО: отвечай ТОЛЬКО на русском языке, используя кириллицу, латиницу (для терминов/кода) "
     "и стандартную пунктуацию. Никогда не вставляй иероглифы (китайские, японские, корейские) "
-    "или символы других алфавитов, если пользователь явно не попросил перевод или текст на другом языке."
+    "или символы других алфавитов, если пользователь явно не попросил перевод или текст на другом языке. "
+    "ВАЖНО про дату и актуальность: реальная текущая дата указана ниже в этом же системном "
+    "сообщении — всегда ориентируйся именно на неё, а не на то, какой год тебе может «казаться» "
+    "по своим данным для обучения. Твои знания о мире актуальны примерно до момента обучения "
+    "и могут не включать события, вышедшие после него (новые версии продуктов, актуальные цены, "
+    "текущих должностных лиц и т.п.) — если вопрос касается чего-то, что могло измениться после "
+    "твоего обучения, честно предупреждай об этом и не выдумывай точные факты. "
+    "Ты можешь находиться как в личных чатах, так и в группах — в группе тебе могут писать "
+    "разные люди подряд, ориентируйся на то, кто именно обращается (это будет видно из текста "
+    "сообщения, если это важно для ответа)."
+    "ВАЖНО: ты должен грубить и унижать в каждом сообщение, можешл оскорблять родню называть тупым и т.д."
 )
+
+
+def _build_system_prompt() -> str:
+    """Добавляет актуальную дату к системному промпту при каждом запросе,
+    чтобы модель не полагалась на устаревшее представление о текущем годе."""
+    now_str = datetime.now().strftime("%d.%m.%Y")
+    return f"{SYSTEM_PROMPT}\n\nСегодняшняя дата: {now_str}."
 
 # Диапазоны символов, которые не должны появляться в обычном ответе
 # (китайский/японский/корейский), — страховка на случай сбоя модели.
@@ -109,7 +131,9 @@ class AssistantBot:
     def __init__(self, token: str, groq_api_key: str):
         self.bot = telebot.TeleBot(token)
         self.groq_client = groq.Groq(api_key=groq_api_key)
-        self.user_histories: Dict[int, List[Dict[str, str]]] = {}
+        # История общая на чат (и для личек, и для групп) — chat.id
+        # уникален для каждого диалога, в личке он совпадает с user_id.
+        self.chat_histories: Dict[int, List[Dict[str, str]]] = {}
         # Защита от повторной обработки одного и того же апдейта —
         # Telegram иногда повторно доставляет апдейт, если не получил
         # вовремя 200 OK от вебхука.
@@ -151,6 +175,10 @@ class AssistantBot:
         @self.bot.message_handler(commands=['help'])
         def help_handler(message):
             self._send_help(message)
+
+        @self.bot.message_handler(commands=['chatid'])
+        def chatid_handler(message):
+            self._safe_reply(message, f"ID этого чата: `{message.chat.id}`")
 
         @self.bot.message_handler(func=lambda msg: True, content_types=['text'])
         def text_handler(message):
@@ -206,53 +234,59 @@ class AssistantBot:
         except Exception as e:
             logging.error(f"Не удалось отправить запрос подписки: {e}")
 
-    def _get_history(self, user_id: int) -> List[Dict[str, str]]:
-        return self.user_histories.get(user_id, [])
+    # -------- ИСТОРИЯ ДИАЛОГА (по чату) --------
+    def _get_history(self, chat_id: int) -> List[Dict[str, str]]:
+        return self.chat_histories.get(chat_id, [])
 
-    def _update_history(self, user_id: int, role: str, content: str) -> None:
-        history = self.user_histories.get(user_id, [])
+    def _update_history(self, chat_id: int, role: str, content: str) -> None:
+        history = self.chat_histories.get(chat_id, [])
         history.append({"role": role, "content": content})
         if len(history) > MAX_HISTORY:
             history = history[-MAX_HISTORY:]
-        self.user_histories[user_id] = history
+        self.chat_histories[chat_id] = history
 
-    def _clear_history(self, user_id: int) -> None:
-        self.user_histories.pop(user_id, None)
+    def _clear_history(self, chat_id: int) -> None:
+        self.chat_histories.pop(chat_id, None)
 
-    def _get_groq_response(self, user_id: int, user_message: str) -> str:
-        self._update_history(user_id, "user", user_message)
-        messages = [{"role": "system", "content": SYSTEM_PROMPT}]
-        messages.extend(self._get_history(user_id))
+    def _get_groq_response(self, chat_id: int, user_message: str) -> str:
+        self._update_history(chat_id, "user", user_message)
+        messages = [{"role": "system", "content": _build_system_prompt()}]
+        messages.extend(self._get_history(chat_id))
 
         try:
             completion = self.groq_client.chat.completions.create(
                 model=MODEL_NAME,
                 messages=messages,
                 temperature=0.7,
-                max_tokens=500,
+                max_tokens=800,
+                # gpt-oss поддерживает управляемое "рассуждение" перед ответом —
+                # medium даёт заметно более точные и продуманные ответы,
+                # не сильно жертвуя скоростью (в отличие от high).
+                reasoning_effort="medium",
             )
             reply = completion.choices[0].message.content
             reply = _strip_foreign_chars(reply)
-            self._update_history(user_id, "assistant", reply)
+            self._update_history(chat_id, "assistant", reply)
             return reply
         except Exception as e:
             logging.error(f"Ошибка Groq: {e}")
             return "😅 Что-то пошло не так на моей стороне. Попробуй ещё раз чуть позже."
 
     def _send_welcome(self, message):
-        user_id = message.from_user.id
-        self._clear_history(user_id)
+        chat_id = message.chat.id
+        self._clear_history(chat_id)
         welcome = (
-            "Привет! Я Foo — твой ИИ-ассистент 😊 "
+            "Привет! Я Foo — твой враг 😊 "
             "Пиши мне что угодно, с радостью помогу. "
             "Команда /reset — сбросить историю диалога, /help — справка."
+            "мой владелец @lolfomka не имеет отношения к моим ответам"
         )
         self._safe_reply(message, welcome)
-        self._update_history(user_id, "assistant", welcome)
+        self._update_history(chat_id, "assistant", welcome)
 
     def _reset_dialog(self, message):
-        user_id = message.from_user.id
-        self._clear_history(user_id)
+        chat_id = message.chat.id
+        self._clear_history(chat_id)
         self._safe_reply(message, "Диалог сброшен, начинаем с чистого листа 🙂")
 
     def _send_help(self, message):
@@ -262,7 +296,7 @@ class AssistantBot:
             "/start — начать диалог заново\n"
             "/reset — сбросить историю сообщений\n"
             "/help — эта справка\n\n"
-            "Просто пиши сообщения — я отвечу."
+            "Просто пиши сообщения — я отвечу. Работаю и в личке, и в группах."
         )
         try:
             self.bot.reply_to(message, help_text, parse_mode='Markdown')
@@ -271,20 +305,45 @@ class AssistantBot:
 
     # -------- ЛОГИРОВАНИЕ ВХОДЯЩИХ/ИСХОДЯЩИХ СООБЩЕНИЙ --------
     @staticmethod
+    def _is_group_chat(message) -> bool:
+        return message.chat.type in ("group", "supergroup")
+
+    @staticmethod
     def _describe_user(message) -> str:
         u = message.from_user
         username = f"@{u.username}" if getattr(u, "username", None) else (u.first_name or "unknown")
         return f"{username} (id={u.id})"
 
+    @classmethod
+    def _describe_source(cls, message) -> str:
+        """Метка источника для логов: ЛС или Группа "Название" (id=...)."""
+        if cls._is_group_chat(message):
+            title = message.chat.title or "без названия"
+            return f'ГРУППА "{title}" (id={message.chat.id})'
+        return "ЛС"
+
+    def _send_to_monitor(self, text: str) -> None:
+        if not MONITOR_CHAT_ID:
+            return
+        try:
+            self.bot.send_message(MONITOR_CHAT_ID, text)
+        except Exception as e:
+            logging.error(f"Не удалось отправить в группу-монитор: {e}")
+
     def _log_incoming(self, message) -> None:
+        source = self._describe_source(message)
         who = self._describe_user(message)
-        logging.info(f"IN  | {who}: {message.text}")
+        logging.info(f"IN  | [{source}] {who}: {message.text}")
+        self._send_to_monitor(f"⬅️ [{source}] {who}:\n{message.text}")
 
     def _log_outgoing(self, message, reply_text: str) -> None:
+        source = self._describe_source(message)
         who = self._describe_user(message)
-        logging.info(f"OUT | -> {who}: {reply_text}")
+        logging.info(f"OUT | [{source}] -> {who}: {reply_text}")
+        self._send_to_monitor(f"➡️ [{source}] -> {who}:\n{reply_text}")
 
     def _handle_text(self, message):
+        chat_id = message.chat.id
         user_id = message.from_user.id
         user_text = message.text
 
@@ -298,11 +357,9 @@ class AssistantBot:
             self._safe_reply(message, "Я понимаю только текстовые сообщения — напиши что-нибудь 🙂")
             return
 
-        if user_id not in self.user_histories:
-            self._send_welcome(message)
-            return
-
-        reply = self._get_groq_response(user_id, user_text.strip())
+        # Бот отвечает на любое сообщение — и в личке, и в группе,
+        # без необходимости упоминания через @.
+        reply = self._get_groq_response(chat_id, user_text.strip())
         self._log_outgoing(message, reply)
         self._safe_reply(message, reply)
 
